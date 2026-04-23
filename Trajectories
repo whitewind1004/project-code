@@ -1,0 +1,192 @@
+import os
+import shutil
+import numpy as np
+from ase.io import read, write
+from ase import Atoms
+from crystmatch import *
+
+# ==========================================
+# 第一部分：晶格枚举与取向分析核心功能
+# ==========================================
+
+def enumerate_csm(init_file, final_file, save_dir, max_mu, max_strain, tol):
+    """枚举所有 CSM 并保存到 npz 文件"""
+    crystA = load_poscar(filename=init_file, to_primitive=False)
+    crystB = load_poscar(filename=final_file, to_primitive=False)
+    check_stoichiometry(crystA[1], crystB[1])
+    zlcm = np.lcm(len(crystA[1]), len(crystB[1]))
+    
+    print("正在枚举 CSMs...")
+    slmlist, pct_arrs, mulist, strainlist, dlist = enumerate_rep_csm(
+        crystA, crystB, max_mu, max_strain, strain=rmss, tol=tol
+    )
+    slm_ind = np.arange(len(slmlist))
+    
+    # 保存结果
+    os.makedirs(save_dir, exist_ok=True)
+    jobname = f"m{max_mu}s{max_strain}"
+    npz_path = os.path.join(save_dir, f"CSMLIST-{jobname}.npz")
+    
+    csm_id = np.arange(len(slm_ind))
+    period = zlcm * mulist
+    
+    header =['csm_id', 'slm_id', 'mu', 'period', 'rmss', 'd']
+    data_table = np.column_stack((csm_id, slm_ind, mulist, period, strainlist, dlist))
+    table = Table(data_table, header)
+    
+    save_npz(unique_filename("保存枚举结果至", npz_path), crystA, crystB, slmlist, slm_ind, pct_arrs, table)
+    
+    return npz_path, csm_id, period, strainlist, dlist
+
+def analyze_or(npz_path, or_dict, tol):
+    """根据保存的 npz 文件分析目标取向关系偏差"""
+    print("正在分析取向关系偏差角...")
+    crystA, crystB, slmlist, slm_ind, _, _ = load_npz(npz_path, verbose=False)
+    or_results = {}
+    
+    for or_name, rel in or_dict.items():
+        vi = miller_to_vec(crystA, rel[0][0], tol=tol)
+        vf = miller_to_vec(crystB, rel[0][1], tol=tol)
+        wi = miller_to_vec(crystA, rel[1][0], tol=tol)
+        wf = miller_to_vec(crystB, rel[1][1], tol=tol)
+        
+        r = orient_matrix(vi, vf, wi, wf)
+        angles = deviation_angle(crystA, crystB, slmlist, r, orientation="norot")[slm_ind]
+        or_results[or_name] = angles
+        
+    return or_results
+
+# ==========================================
+# 第二部分：相变轨迹生成功能 (POSCAR & XYZ)
+# ==========================================
+
+def normalize_lattice(L1, L2):
+    """晶格重整与正交化"""
+    L1, L2 = np.array(L1), np.array(L2)
+    n = L1.shape[0]
+    L2_new = L2.copy()
+    for j in range(n):
+        if np.any(np.sign(L1[j, j]) != np.sign(L2[j, j])):
+            L2_new[:, j] *= -1
+    return L2_new
+
+def lq_decomposition(crystA, crystB):
+    """对晶格进行 LQ 分解以符合 VASP 标准下三角矩阵"""
+    Q_A, R_A = np.linalg.qr(crystA[0].T)    
+    Q_B, R_B = np.linalg.qr(crystB[0].T)
+    R_A_T = R_A.T
+    R_B_T = normalize_lattice(R_A.T, R_B.T)
+    return (R_A_T,) + crystA[1:], (R_B_T,) + crystB[1:]
+
+def interpolate_structures(poscar1, poscar2, n=50):
+    """使用 ASE 插值生成轨迹"""
+    struct1 = read(poscar1, format="vasp")
+    struct2 = read(poscar2, format="vasp")
+    structures =[]
+    for alpha in np.linspace(0, 1, n):
+        cell = (1 - alpha) * struct1.get_cell() + alpha * struct2.get_cell()
+        positions = (1 - alpha) * struct1.get_positions() + alpha * struct2.get_positions()
+        new_struct = Atoms(symbols=struct1.get_chemical_symbols(),
+                           positions=positions, cell=cell, pbc=True)
+        structures.append(new_struct)
+    return structures
+
+def generate_csm_trajectories(npz_file, base_save_dir):
+    """读取 npz 文件，输出各匹配的 POSCAR 和 插值 XYZ 轨迹"""
+    print("\n正在生成结构与插值轨迹...")
+    crystA, crystB, slmlist, slm_ind, pct_arrs, _ = load_npz(npz_file, verbose=False)
+    
+    # 创建专门放结构文件的子文件夹
+    traj_dir = os.path.join(base_save_dir, "Trajectories")
+    os.makedirs(traj_dir, exist_ok=True)
+    
+    for i in range(len(slm_ind)):
+        slm, p, ks = unzip_csm(i, crystA, crystB, slmlist, slm_ind, pct_arrs)
+        
+        # 提取结构 (无旋转 norot 和 保持不变面 uspfixed)
+        crystA_matched, crystB_matched, crystC_matched = csm_to_cryst(
+            crystA, crystB, slm, p, ks, orientation='uspfixed', min_t0=True, weight_func=None
+        )
+        
+        # 处理晶格矩阵
+        crystA_norot, crystB_norot = lq_decomposition(crystA_matched, crystB_matched)
+        crystA_usp, crystC_usp = lq_decomposition(crystA_matched, crystC_matched)
+        
+        # 创建单个 CSM 的文件夹
+        csm_dir = os.path.join(traj_dir, f"CSM_{i}")
+        if os.path.exists(csm_dir):
+            shutil.rmtree(csm_dir)
+        os.makedirs(csm_dir)
+        
+        # 定义保存路径
+        pos_norot_I = os.path.join(csm_dir, "POSCAR_norot_I")
+        pos_norot_F = os.path.join(csm_dir, "POSCAR_norot_F")
+        pos_usp_I = os.path.join(csm_dir, "POSCAR_uspfixed_I")
+        pos_usp_F = os.path.join(csm_dir, "POSCAR_uspfixed_F")
+        
+        # 写入 POSCAR
+        save_poscar(pos_norot_I, crystA_norot, crystname=f"CSM_{i} initial (norot)")
+        save_poscar(pos_norot_F, crystB_norot, crystname=f"CSM_{i} final (norot)")
+        save_poscar(pos_usp_I, crystA_usp, crystname=f"CSM_{i} initial (uspfixed)")
+        save_poscar(pos_usp_F, crystC_usp, crystname=f"CSM_{i} final (uspfixed)")
+        
+        # 插值并写入 XYZ 轨迹
+        traj_norot = interpolate_structures(pos_norot_I, pos_norot_F, n=50)
+        traj_usp = interpolate_structures(pos_usp_I, pos_usp_F, n=50)
+        
+        write(os.path.join(csm_dir, "traj_norot.xyz"), traj_norot, format="extxyz")
+        write(os.path.join(csm_dir, "traj_uspfixed.xyz"), traj_usp, format="extxyz")
+        
+        print(f"  已完成 CSM_{i} 轨迹导出。")
+
+
+# ==========================================
+# 主程序入口
+# ==========================================
+if __name__ == "__main__":
+    # 1. 基础参数设置
+    max_mu = 2        # 复杂度
+    max_strain = 0.3  # 最大 RMSS
+    tol = 1e-3
+
+    # 请确保 C(Graphite).poscar 和 C (Diamond).poscar 存在于你运行代码的当前文件夹中！
+    # 注意文件名中的空格，必须和实际文件完全一致
+    init_file = r"" 
+    final_file = r"" 
+    save_dir = r"CSM_output"  # 所有结果都保存在这个文件夹下
+
+    # 注意：这里的 target_ors 是默认的钢(BCC-FCC)的经典取向关系
+    # 算石墨和金刚石时，这些关系虽然会在数学上硬算个偏差角出来，但物理意义不大
+    # 如果你不需要，可以保留原样，它只是输出多几列数据而已。
+    target_ors = {
+        "GT":     [[[0, 0, 1],  [0, 1, 3]],  [[1, 1, 0],  [1, 1, 1]]],
+        "KS":     [[[1, 1, 1],  [0, 1, 1]],  [[1, 0, -1],[1, 1, -1]]],
+        "NW":     [[[1, 1, 1],  [0, 1, 1]],  [[1, -1, 0],[0, 0, 1]]],
+        "Bain":   [[[0, 0, 1],  [0, 0, 1]],  [[1, 0, 0],[1, 1, 0]]],
+        "Pitsch": [[[0, 0, 1],[0, 1, 1]],  [[1, 1, 0],[1, 0, 0]]]
+    }
+
+    # 2. 执行枚举 (生成 npz 文件)
+    npz_path, ids, periods, strains, dists = enumerate_csm(
+        init_file, final_file, save_dir, max_mu, max_strain, tol
+    )
+
+    # 3. 执行取向关系分析
+    or_angles = analyze_or(npz_path, target_ors, tol)
+
+    # 4. 写入分析结果的文本文件
+    txt_out = os.path.join(save_dir, "CSM_Results.txt")
+    with open(txt_out, "w") as f:
+        or_names = list(target_ors.keys())
+        header = "ID\tPeriod\tRMSS\tRMSD(d)\t" + "\t".join(f"{name}_Angle" for name in or_names)
+        f.write(header + "\n")
+        for i in range(len(ids)):
+            base_str = f"{ids[i]:.0f}\t{periods[i]:.0f}\t{strains[i]:.6f}\t{dists[i]:.6f}"
+            or_str = "\t".join(f"{or_angles[name][i]:.6f}" for name in or_names)
+            f.write(f"{base_str}\t{or_str}\n")
+    print(f"数据总表已保存至: {txt_out}")
+
+    # 5. 生成插值动画轨迹 (调用整合后的第二段代码)
+    generate_csm_trajectories(npz_path, save_dir)
+    
+    print("\n所有任务已全部顺利完成！")
