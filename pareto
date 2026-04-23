@@ -1,0 +1,71 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import io
+
+# 1. 你的原始数据 
+data_str = """ID	Period	RMSS	RMSD(d)	GT_Angle	KS_Angle	NW_Angle	Bain_Angle	Pitsch_Angle
+"""
+
+# 读取数据
+df = pd.read_csv(io.StringIO(data_str), sep='\t')
+
+# 2. 核心算法：提取帕累托前沿 (寻找左下边界)
+def find_pareto_front(df, x_col, y_col):
+    # 先按照 RMSS(x) 从小到大排序，如果相等再按照 RMSD(y) 从小到大排序
+    sorted_df = df.sort_values(by=[x_col, y_col]).reset_index(drop=True)
+    
+    pareto_indices =[]
+    min_y = float('inf')
+    
+    # 遍历排序后的点，如果找到更小的 y，就加入帕累托前沿
+    for idx, row in sorted_df.iterrows():
+        if row[y_col] < min_y:
+            pareto_indices.append(idx)
+            min_y = row[y_col]
+            
+    return sorted_df.iloc[pareto_indices]
+
+pareto_df = find_pareto_front(df, 'RMSS', 'RMSD(d)')
+
+# 3. 绘图 
+plt.figure(figsize=(9, 6), dpi=150)
+
+# 画所有的点，根据 Period 映射颜色
+scatter = plt.scatter(df['RMSS'], df['RMSD(d)'], 
+                      c=df['Period'], cmap='viridis_r', 
+                      s=80, alpha=0.8, edgecolors='white', label='All CSMs')
+
+# 添加颜色条
+cbar = plt.colorbar(scatter)
+cbar.set_label(r'Period ($\tilde{Z}$)', fontsize=12)
+
+# 画帕累托前沿连线和标记
+plt.plot(pareto_df['RMSS'], pareto_df['RMSD(d)'], color='red', linestyle='-', linewidth=2, zorder=1)
+plt.scatter(pareto_df['RMSS'], pareto_df['RMSD(d)'], color='red', marker='*', s=200, label='Pareto Front', zorder=2)
+
+# 标注 Bain 机制 (当前数据中的最优点)
+plt.annotate('Bain mechanism\n(ID:0)', 
+             xy=(pareto_df['RMSS'].iloc[0], pareto_df['RMSD(d)'].iloc[0]), 
+             xytext=(pareto_df['RMSS'].iloc[0] + 0.02, pareto_df['RMSD(d)'].iloc[0] + 0.05), # 稍微调整了文字偏移量使其更美观
+             arrowprops=dict(facecolor='black', shrink=0.05, width=1, headwidth=6),
+             fontsize=10, fontweight='bold')
+
+# 设置轴标签和样式
+plt.xlabel('Root-mean-square strain (RMSS)', fontsize=12)
+plt.ylabel('RMSD ($\AA$)', fontsize=12)
+plt.title('Crystal-Structure Matches: Pareto Front', fontsize=14)
+plt.grid(True, linestyle='--', alpha=0.5)
+plt.legend(loc='upper right')
+
+# ================= 关键修改部分 =================
+# 动态计算最小值和最大值，并在两端增加余量(Margin)，使画面更宽裕
+x_min, x_max = df['RMSS'].min(), df['RMSS'].max()
+y_min, y_max = df['RMSD(d)'].min(), df['RMSD(d)'].max()
+
+plt.xlim(x_min - 0.05, x_max + 0.05)  # X轴向左右各扩展 0.05 的量程
+plt.ylim(y_min - 0.15, y_max + 0.15)  # Y轴向上下各扩展 0.15 的量程
+# ================================================
+
+plt.tight_layout()
+plt.show()
